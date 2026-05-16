@@ -1,0 +1,76 @@
+# --- Секреты и пользовательские данные ---
+.env
+.env.local
+.env.*.local
+ntd_bot/users.json
+ntd_bot/users.db
+users.json
+users.db
+
+# --- Данные RAG (документы и векторная БД) ---
+data/
+*.sqlite3
+*.sqlite
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Виртуальные окружения ---
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- IDE / редакторы ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Тесты и линтеры ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# --- Логи и временные файлы ---
+*.log
+logs/
+tmp/
+temp/
+
+# --- Модели и кэши ML ---
+.cache/
+models/
+*.bin
+*.safetensors
+
+# --- Eval results ---
+eval_output/
