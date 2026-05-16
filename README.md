@@ -133,12 +133,6 @@ ntd_bot/
 └── user_store.py      # allowlist в users.json
 ```
 
-## Замечания по безопасности
-
-- `.env`, `users.json`, `users.db` и папка `data/` исключены через `.gitignore`. **Не коммитьте их.**
-- При компрометации `BOT_TOKEN` немедленно отзовите его через [@BotFather](https://t.me/BotFather) → `/mybots` → API Token → **Revoke**.
-- Бот рассчитан на работу в закрытом контуре. Публичный деплой требует дополнительной проработки allowlist'а и rate limiting.
-
 ## Лицензия
 
 Укажите по своему усмотрению (MIT / Apache-2.0 / проприетарная).
