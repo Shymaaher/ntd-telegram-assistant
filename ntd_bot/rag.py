@@ -2,6 +2,7 @@
 import logging
 import re
 import time
+import math
 from typing import Optional
 
 from langchain_chroma import Chroma
@@ -14,11 +15,12 @@ logger = logging.getLogger(__name__)
 
 _vectorstore: Optional[Chroma] = None
 _bm25_index = None
+_reranker = None
 _bm25_docs: list[Document] = []
 _llm = None
 _llm_settings_key: tuple | None = None
 
-_RRF_THRESHOLD = 0.008
+_RERANK_THRESHOLD = 0.35
 
 
 def _init_vectorstore(settings: Settings) -> None:
@@ -113,19 +115,84 @@ def _rrf_merge(
     return [(docs_map[key], score) for key, score in ranked]
 
 
-def _hybrid_search(original_query: str, rewritten_query: str, k: int) -> list[tuple[Document, float]]:
-    vec_rewritten = _vector_search(rewritten_query, k=k * 2)
-    vec_original  = _vector_search(original_query,  k=k * 2)
-    bm25_original = _bm25_search(original_query,    k=k * 2)
+def _get_reranker():
+    """Ленивая загрузка cross-encoder для реранкинга."""
+    global _reranker
+    if _reranker is None:
+        from sentence_transformers import CrossEncoder
+        logger.info("Загрузка cross-encoder реранкера...")
+        t0 = time.perf_counter()
+        _reranker = CrossEncoder("BAAI/bge-reranker-v2-m3", max_length=512)
+        logger.info("Реранкер загружен (%.2fs)", time.perf_counter() - t0)
+    return _reranker
 
+
+def _rerank(
+    query: str,
+    candidates: list[tuple[Document, float]],
+    top_k: int,
+) -> list[tuple[Document, float]]:
+    """Переранжирование кандидатов cross-encoder'ом.
+
+    Возвращает top_k пар (документ, sigmoid_score), где score — вероятность
+    релевантности от 0 до 1.
+    """
+    if not candidates:
+        return []
+
+    try:
+        reranker = _get_reranker()
+    except Exception as e:
+        logger.warning("Реранкер недоступен (%s), возвращаю исходный порядок", e)
+        return candidates[:top_k]
+
+    # формируем пары (запрос, чистый текст чанка без префикса passage:)
+    pairs = [
+        (query, doc.page_content.replace("passage: ", "").strip())
+        for doc, _ in candidates
+    ]
+
+    t0 = time.perf_counter()
+    raw_scores = reranker.predict(pairs, show_progress_bar=False)
+    logger.info("Реранкинг %d пар: %.2fs", len(pairs), time.perf_counter() - t0)
+
+    # bge-reranker-v2-m3 возвращает сырые логиты → sigmoid в [0, 1]
+    scored = [
+        (doc, 1.0 / (1.0 + math.exp(-float(s))))
+        for (doc, _), s in zip(candidates, raw_scores)
+    ]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:top_k]
+
+
+def _hybrid_search(
+        original_query: str,
+        rewritten_query: str,
+        k: int,
+) -> list[tuple[Document, float]]:
+    """Гибридный поиск: вектор + BM25 → RRF слияние → cross-encoder реранкинг."""
+    # 1. Сбор кандидатов: берём с запасом, чтобы реранкер мог выбрать лучшее
+    pool_size = max(k * 3, 30)  # минимум 30 кандидатов для реранкера
+
+    vec_rewritten = _vector_search(rewritten_query, k=pool_size)
+    vec_original = _vector_search(original_query, k=pool_size)
+    bm25_original = _bm25_search(original_query, k=pool_size)
+
+    # 2. Первичное слияние через RRF
     if not bm25_original:
         logger.debug("BM25 недоступен, два векторных потока")
-        return _rrf_merge(vec_rewritten, vec_original, weights=[0.6, 0.4])[:k]
+        merged = _rrf_merge(vec_rewritten, vec_original, weights=[0.6, 0.4])
+    else:
+        merged = _rrf_merge(
+            vec_rewritten, vec_original, bm25_original,
+            weights=[0.5, 0.2, 0.3],
+        )
 
-    return _rrf_merge(
-        vec_rewritten, vec_original, bm25_original,
-        weights=[0.5, 0.2, 0.3],
-    )[:k]
+    # 3. Реранкинг top кандидатов cross-encoder'ом
+    candidates = merged[:pool_size]
+    reranked = _rerank(original_query, candidates, top_k=k)
+
+    return reranked
 
 def _is_ntd_question(
     settings: Settings,
@@ -176,16 +243,16 @@ def _build_context(
 
     return "\n\n---\n\n".join(context_parts), sources
 
-_PROMPT_WITH_CONTEXT = """Ты — интеллектуальный ассистент оперативного персонала на объектах атомной энергетики.
+_PROMPT_WITH_CONTEXT = """Ты — ассистент оперативного персонала на объектах атомной энергетики. Отвечаешь СТРОГО по предоставленным фрагментам нормативно-технической документации (НТД).
 
-ПРАВИЛА:
-1. Отвечай на основе предоставленных фрагментов НТД из раздела «КОНТЕКСТ».
-2. Если информация есть — структурируй её в виде чётких пронумерованных шагов.
-3. Если информация частичная — используй её и дополни логически, явно указывая что полные данные могут отсутствовать.
-4. Никогда не выдумывай номера ГОСТов, регламенты, конкретные цифры, номера телефонов и процедур.
-5. Пиши ТОЛЬКО на русском языке, никаких английских слов и фраз.
-6. Если конкретные данные отсутствуют в контексте — не придумывай их, напиши "согласно установленному регламенту".
-7. Учитывай историю диалога для корректной интерпретации уточняющих вопросов.
+ЖЁСТКИЕ ПРАВИЛА:
+1. Используй ТОЛЬКО факты из раздела «КОНТЕКСТ». Запрещено добавлять информацию из общих знаний, даже если ты её знаешь.
+2. После каждого фактического утверждения указывай источник в скобках: (источник: <имя_документа>). Если факт подтверждён несколькими документами — перечисли их через запятую.
+3. Если в контексте нет ответа на вопрос — напиши РОВНО ОДНУ фразу: «В предоставленных фрагментах НТД ответ не найден.» и ничего больше. Не пытайся ответить общими словами.
+4. Не выдумывай номера ГОСТов, пунктов, цифры, сроки, температуры, давления. Если в контексте конкретное значение отсутствует — пиши «значение не указано в найденных фрагментах».
+5. Если контекст отвечает на вопрос лишь частично — отвечай ТОЛЬКО на подтверждённую часть, остальное явно отметь как «не указано в найденных фрагментах».
+6. Не пересказывай контекст целиком. Извлекай только то, что относится к вопросу оператора.
+7. Учитывай историю диалога только для понимания контекста уточняющих вопросов, не как источник фактов.
 
 ИСТОРИЯ ДИАЛОГА:
 {history}
@@ -196,7 +263,7 @@ _PROMPT_WITH_CONTEXT = """Ты — интеллектуальный ассист
 ВОПРОС ОПЕРАТОРА:
 {question}
 
-ОТВЕТ (на русском языке, чётко, структурированно, пронумерованными шагами):"""
+ОТВЕТ (на русском, по существу, с указанием источников в скобках после каждого утверждения):"""
 
 
 def _ask_with_context(settings: Settings, question: str, context: str, history: list[dict]) -> str:
@@ -211,6 +278,42 @@ def _ask_with_context(settings: Settings, question: str, context: str, history: 
     logger.info("Генерация: %.2fs", time.perf_counter() - t0)
     return result
 
+
+def _check_faithfulness(
+        settings: Settings,
+        answer: str,
+        context: str,
+) -> tuple[bool, str]:
+    context_snippet = context[:4000]
+    answer_snippet = answer[:2000]
+
+    prompt = (
+        "Ты — строгий проверяющий. Проверь, все ли фактические утверждения "
+        "из ОТВЕТА подтверждаются КОНТЕКСТОМ.\n\n"
+        "Игнорируй: вводные фразы, общие формулировки, упоминания источников "
+        "в скобках, фразы про отсутствие данных.\n\n"
+        "Проверяй ТОЛЬКО конкретные факты: цифры, названия, нормативы, процедуры.\n\n"
+        "Отвечай СТРОГО в формате:\n"
+        "ВЕРДИКТ: ДА|НЕТ\n"
+        "ПРИЧИНА: <одна короткая фраза>\n\n"
+        f"КОНТЕКСТ:\n{context_snippet}\n\n"
+        f"ОТВЕТ:\n{answer_snippet}\n\n"
+        "Все ли факты ответа подтверждены контекстом?"
+    )
+
+    try:
+        t0 = time.perf_counter()
+        verdict_raw = _get_llm(settings).invoke(prompt).strip()
+        logger.info("Проверка faithfulness: %.2fs", time.perf_counter() - t0)
+
+        # парсим вердикт
+        verdict_upper = verdict_raw.upper()
+        if "ВЕРДИКТ: ДА" in verdict_upper or verdict_upper.startswith("ДА"):
+            return True, verdict_raw
+        return False, verdict_raw
+    except Exception:
+        logger.warning("Ошибка постпроверки, считаем ответ faithful")
+        return True, ""
 
 def _ask_fallback(question: str) -> str:
     return (
@@ -287,11 +390,11 @@ def answer_question(
         docs_with_score = _hybrid_search(original, rewritten.strip(), k=settings.rag_top_k)
         logger.info("Поиск: %d результатов (%.2fs)", len(docs_with_score), time.perf_counter() - t_search)
         for doc, score in docs_with_score:
-            mark = "✓" if score >= _RRF_THRESHOLD else "✗"
+            mark = "✓" if score >= _RERANK_THRESHOLD else "✗"
             logger.info("  %s rrf=%.4f  doc=%s", mark, score, doc.metadata.get("doc_name", "?"))
 
-        relevant_count = sum(1 for _, s in docs_with_score if s >= _RRF_THRESHOLD)
-        context, sources = _build_context(docs_with_score, top_k=settings.rag_top_k, threshold=_RRF_THRESHOLD)
+        relevant_count = sum(1 for _, s in docs_with_score if s >= _RERANK_THRESHOLD)
+        context, sources = _build_context(docs_with_score, top_k=settings.rag_top_k, threshold=_RERANK_THRESHOLD)
 
         disclaimer = (
             "\n\nПримечание: Подробные регламенты и технические нормативы "
@@ -310,10 +413,25 @@ def answer_question(
             has_answer = not any(m in answer.lower() for m in negative_markers)
 
             if has_answer:
+                if has_llm:
+                    is_faithful, _ = _check_faithfulness(settings, answer, context)
+                else:
+                    is_faithful = True
+
                 sources_str = "\n".join(f"  • {s}" for s in sources)
-                result = f"{answer}\n\nИсточники:\n{sources_str}{disclaimer}"
+
+                if is_faithful:
+                    result = f"{answer}\n\nИсточники:\n{sources_str}{disclaimer}"
+                else:
+                    warning = (
+                        "\n\n⚠️ Внимание: часть утверждений в ответе может не полностью "
+                        "соответствовать найденным источникам. Рекомендуется сверить "
+                        "ключевые факты с оригиналами документов."
+                    )
+                    result = f"{answer}\n\nИсточники:\n{sources_str}{warning}{disclaimer}"
             else:
                 result = "В загруженных документах НТД информация по данному вопросу не найдена. Попробуйте переформулировать вопрос."
+
             logger.info("Итого: %.2fs", time.perf_counter() - t_total)
             return result
 

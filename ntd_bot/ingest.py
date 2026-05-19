@@ -17,8 +17,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 500
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 120
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 250
 SUPPORTED_EXTENSIONS = {".pdf", ".txt"}
 
 
@@ -47,6 +47,18 @@ def ingest_documents(reset: bool = False) -> None:
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
+        separators=[
+            "\n\n\n",  # крупные блоки
+            "\n\n",  # абзацы
+            "\n",  # строки
+            ". ",  # предложения
+            "; ",  # части сложных предложений
+            ", ",  # перечисления
+            " ",  # слова
+            "",  # символы (последний резерв)
+        ],
+        keep_separator=True,
+        length_function=len,
     )
 
     doc_dir = Path(settings.documents_dir)
